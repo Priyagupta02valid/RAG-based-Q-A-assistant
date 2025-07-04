@@ -1,119 +1,90 @@
 import streamlit as st
-import faiss
+from llama_cpp import Llama
+import fitz  # PyMuPDF
 import os
+from sentence_transformers import SentenceTransformer
+import faiss
 import numpy as np
-from io import BytesIO
-import requests
+from collections import Counter
+import re
 
-from docx import Document
-from dotenv import load_dotenv
-load_dotenv()
-from PyPDF2 import PdfReader
+# --- Load LLM ---
+MODEL_PATH = "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+llm = Llama(model_path=MODEL_PATH, n_ctx=2048)
 
-from langchain_community.document_loaders import WebBaseLoader
-from langchain.text_splitter import CharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
+# --- Load Sentence Transformer ---
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-# Use a free model
-HF_MODEL = "google/flan-t5-large"
+# --- Streamlit Setup ---
+st.set_page_config(page_title="PDF QA Chatbot", layout="wide")
+st.title(" PDF ChatBot (RAG with TinyLlama)")
 
-# Set environment variable
-hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+# --- Upload PDF ---
+uploaded_pdf = st.file_uploader("Upload a PDF", type="pdf")
 
+if uploaded_pdf:
+    with st.spinner(" Reading PDF..."):
+        doc = fitz.open(stream=uploaded_pdf.read(), filetype="pdf")
+        text_chunks = []
+        for page in doc:
+            text_chunks.append(page.get_text())
+        full_text = " ".join(text_chunks)
 
-def process_input(input_type, input_data):
-    if input_type == "Link":
-        loader = WebBaseLoader(input_data)
-        documents = loader.load()
-        raw_text = "\n".join([doc.page_content for doc in documents])
-    elif input_type == "PDF":
-        pdf_reader = PdfReader(BytesIO(input_data.read()))
-        raw_text = "".join(page.extract_text() for page in pdf_reader.pages if page.extract_text())
-    elif input_type == "Text":
-        raw_text = input_data
-    elif input_type == "DOCX":
-        doc = Document(BytesIO(input_data.read()))
-        raw_text = "\n".join([para.text for para in doc.paragraphs])
-    elif input_type == "TXT":
-        raw_text = input_data.read().decode('utf-8')
-    else:
-        raise ValueError("Unsupported input type")
+    # --- Show extracted keywords ---
+    def extract_keywords(text, top_n=10):
+        words = re.findall(r'\b\w+\b', text.lower())
+        stopwords = set([
+            "the", "and", "for", "are", "that", "this", "with", "you", "your",
+            "from", "was", "have", "not", "but", "all", "can", "has", "had", 
+            "pdf", "they", "will", "their", "which", "been", "use", "using", "also"
+        ])
+        filtered_words = [word for word in words if word not in stopwords and len(word) > 3]
+        common = Counter(filtered_words).most_common(top_n)
+        return [f"{word} ({count})" for word, count in common]
 
-    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    texts = text_splitter.split_text(raw_text)
+    st.subheader(" Top Keywords in PDF")
+    keywords = extract_keywords(full_text)
+    st.write(", ".join(keywords))
 
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
+    # --- Split into chunks ---
+    def chunk_text(text, max_tokens=200):
+        words = text.split()
+        return [" ".join(words[i:i+max_tokens]) for i in range(0, len(words), max_tokens)]
 
-    vectorstore = FAISS.from_texts(texts, embedding=embeddings)
+    chunks = chunk_text(full_text)
 
-    return vectorstore
+    # --- Embedding + FAISS indexing ---
+    with st.spinner(" Embedding and indexing..."):
+        embeddings = embedder.encode(chunks)
+        dimension = embeddings.shape[1]
+        index = faiss.IndexFlatL2(dimension)
+        index.add(np.array(embeddings))
 
-def answer_question(vectorstore, query):
-    try:
-        docs = vectorstore.similarity_search(query, k=3)
-        context = "\n".join([doc.page_content for doc in docs])
+    st.success(" PDF processed and ready!")
 
-        payload = {
-            "inputs": f"Context: {context}\n\nQuestion: {query}",
-            "parameters": {"temperature": 0.7, "max_new_tokens": 300}
-        }
+    # --- Chat interface ---
+    user_question = st.text_input(" Ask a question from the PDF:")
+    if user_question:
+        with st.spinner(" Finding best context..."):
+            query_embedding = embedder.encode([user_question])
+            D, I = index.search(np.array(query_embedding), k=3)
+            context = "\n\n".join([chunks[i] for i in I[0]])
 
-        headers = {
-            "Authorization": f"Bearer {hf_token}"
-        }
+        # --- Prompt for TinyLlama ---
+        prompt = f"""
+You are a helpful assistant. Use the context below to answer the user's question.
 
-        response = requests.post(
-            f"https://api-inference.huggingface.co/models/{HF_MODEL}",
-            headers=headers,
-            json=payload
-        )
+### Context:
+{context}
 
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list) and "generated_text" in result[0]:
-                return result[0]["generated_text"]
-            else:
-                return str(result)
-        else:
-            return f"Error: {response.status_code} - {response.text}"
+### Question:
+{user_question}
 
-    except Exception as e:
-        return f" Exception occurred: {str(e)}"
+### Answer:
+"""
 
-def main():
-    st.set_page_config(page_title=" RAG Q&A with HuggingFace", layout="centered")
-    st.title(" RAG based Assistant") 
-
-    input_type = st.selectbox("Select Input Type", ["Link", "PDF", "Text", "DOCX", "TXT"])
-    input_data = None
-
-    if input_type == "Link":
-        url = st.text_input("Enter a URL")
-        input_data = url
-    elif input_type == "Text":
-        input_data = st.text_area("Enter text here")
-    else:
-        input_data = st.file_uploader("Upload file", type=["pdf", "txt", "docx"])
-
-    if st.button("Process Document"):
-        if input_data:
-            with st.spinner("Processing..."):
-                try:
-                    vectorstore = process_input(input_type, input_data)
-                    st.session_state.vectorstore = vectorstore
-                    st.success("✅ Document processed and indexed!")
-                except Exception as e:
-                    st.error(f"Failed to process: {e}")
-        else:
-            st.warning("Please upload or enter content.")
-
-    if "vectorstore" in st.session_state:
-        query = st.text_input("Ask a question:")
-        if st.button("Submit Question"):
-            with st.spinner("Thinking..."):
-                answer = answer_question(st.session_state.vectorstore, query)
-                st.markdown(f"### Answer:\n{answer}")
-
-if __name__ == "__main__":
-    main()
+        with st.spinner(" Generating answer..."):
+            response = llm(prompt, max_tokens=200, stop=["###"])
+            answer = response["choices"][0]["text"].strip()
+            st.markdown("**Answer:**")
+            st.write(answer)
