@@ -1,4 +1,5 @@
- #TinyLlama PDF Question-Answer ChatBot (RAG-based)
+**TinyLlama PDF Question-Answer ChatBot (RAG-based)**
+
 # Offline PDF ChatBot – No API Key Required
 
 A smart PDF Question-Answering ChatBot that works 100% offline — no OpenAI, no Hugging Face API, and no internet dependency!
@@ -25,5 +26,6 @@ Built with:
 
 ### 1. Clone the repo
 ```bash
-git clone https://github.com/yourusername/offline-pdf-chatbot.git
-cd offline-pdf-chatbot
+git clone https://github.com/Priyagupta02valid/RAG-based-Q-A-assistant.git
+cd RAG-based-Q-A-assistant
+
